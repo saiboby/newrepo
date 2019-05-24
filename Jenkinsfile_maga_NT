@@ -1,0 +1,178 @@
+pipeline {
+    agent { label 'docker' }
+    // triggers {
+    //     cron('H 1 * * *')
+    // }
+
+    environment {
+        NIGHTLY_BUILD_DATE = new Date().format("yyyy-MM-dd")
+        branch = "develop"
+    }
+
+    stages {
+        stage('Build') {
+            steps {
+                parallel(
+                        failFast: true,
+                        "tesseract-collectors": {
+                            build job: 'tesseract-collectors/develop',
+                                    parameters: [
+                                            string(name: 'NIGHTLY_JOB_NAME', value: String.valueOf(JOB_BASE_NAME)),
+                                            string(name: 'NIGHTLY_BUILD_ID', value: String.valueOf(BUILD_NUMBER)),
+                                            string(name: 'NIGHTLY_BUILD_DATE', value: String.valueOf(NIGHTLY_BUILD_DATE))
+                                    ]
+
+                        },
+                        "ndp-base-pipelines": {
+                            echo "I'm on the ndp-base-pipelines!"
+                            build job: 'ndp-base-pipelines/develop',
+                                    parameters: [
+                                            string(name: 'NIGHTLY_JOB_NAME', value: String.valueOf(JOB_BASE_NAME)),
+                                            string(name: 'NIGHTLY_BUILD_ID', value: String.valueOf(BUILD_NUMBER)),
+                                            string(name: 'NIGHTLY_BUILD_DATE', value: String.valueOf(NIGHTLY_BUILD_DATE))
+                                    ]
+
+                        },
+                        "magellan": {
+                            echo "I'm on the magellan!"
+                            build job: 'magellan-be/develop-v4',
+                                    parameters: [
+                                            string(name: 'NIGHTLY_JOB_NAME', value: String.valueOf(JOB_BASE_NAME)),
+                                            string(name: 'NIGHTLY_BUILD_ID', value: String.valueOf(BUILD_NUMBER)),
+                                            string(name: 'NIGHTLY_BUILD_DATE', value: String.valueOf(NIGHTLY_BUILD_DATE))
+                                    ]
+                        })
+            }
+        }
+
+        stage('Building Magellan UI') {
+            steps {
+                build job: 'magellan-ui/develop',
+                        parameters: [
+                                string(name: 'NIGHTLY_JOB_NAME', value: String.valueOf(JOB_BASE_NAME)),
+                                string(name: 'NIGHTLY_BUILD_ID', value: String.valueOf(BUILD_NUMBER)),
+                                string(name: 'NIGHTLY_BUILD_DATE', value: String.valueOf(NIGHTLY_BUILD_DATE))
+                        ]
+            }
+
+        }
+
+
+        stage('Packaging') {
+            steps {
+                build job: 'packaging',
+                        parameters: [
+                                string(name: 'NIGHTLY_JOB_NAME', value: String.valueOf(JOB_BASE_NAME)),
+                                string(name: 'NIGHTLY_BUILD_ID', value: String.valueOf(BUILD_NUMBER)),
+                                string(name: 'NIGHTLY_BUILD_DATE', value: String.valueOf(NIGHTLY_BUILD_DATE)),
+                                string(name: 'NIGHTLY_BRANCH_NAME', value: 'develop')
+                        ]
+            }
+        }
+        stage('Revert Snapshot') {
+            environment {
+                VSPHERE_CLOUD_NAME = 'vsphere-ft-vm'
+                MAGLEV_MACHINE_NAME = 'maglev-81'
+//                MAGLEV_SNAPSHOT_NAME = 'NDP Installed With Config'
+                MAGLEV_SNAPSHOT_NAME = 'Maglev Installed'
+                ISE_MACHINE_NAME = 'ISE-Sentinels'
+                ISE_SNAPSHOT_NAME = 'Clean ISE with PEZ'
+                FC_MACHINE_NAME = 'Lancope FlowCollector NetFlow'
+                FC_SNAPSHOT_NAME = 'Flow Collector With Data'
+                SMC_MACHINE_NAME = 'Lancope SMC'
+                SMC_SNAPSHOT_NAME = 'SW With Data'
+            }
+
+            steps {
+                //build job: 'revert-vm-snapshot',
+                //    parameters: [
+                //        string(name: 'VSPHERE_CLOUD_NAME', value: String.valueOf(VSPHERE_CLOUD_NAME)),
+                //        string(name: 'VIRTUAL_MACHINE_NAME', value: String.valueOf(ISE_MACHINE_NAME)),
+                //        string(name: 'SNAPSHOT_NAME', value: String.valueOf(ISE_SNAPSHOT_NAME))
+                //    ]
+                //sleep 60
+
+                //build job: 'revert-vm-snapshot',
+                //    parameters: [
+                //        string(name: 'VSPHERE_CLOUD_NAME', value: String.valueOf(VSPHERE_CLOUD_NAME)),
+                //        string(name: 'VIRTUAL_MACHINE_NAME', value: String.valueOf(FC_MACHINE_NAME)),
+                //        string(name: 'SNAPSHOT_NAME', value: String.valueOf(FC_SNAPSHOT_NAME))
+                //    ]
+
+                //sleep 60
+
+                build job: 'revert-vm-snapshot',
+                    parameters: [
+                        string(name: 'VSPHERE_CLOUD_NAME', value: String.valueOf(VSPHERE_CLOUD_NAME)),
+                        string(name: 'VIRTUAL_MACHINE_NAME', value: String.valueOf(SMC_MACHINE_NAME)),
+                        string(name: 'SNAPSHOT_NAME', value: String.valueOf(SMC_SNAPSHOT_NAME))
+                    ]
+                sleep 60
+                build job: 'revert-vm-snapshot',
+                    parameters: [
+                        string(name: 'VSPHERE_CLOUD_NAME', value: String.valueOf(VSPHERE_CLOUD_NAME)),
+                        string(name: 'VIRTUAL_MACHINE_NAME', value: String.valueOf(MAGLEV_MACHINE_NAME)),
+                        string(name: 'SNAPSHOT_NAME', value: String.valueOf(MAGLEV_SNAPSHOT_NAME))
+                    ]
+                sleep 900
+            }
+        }
+
+        stage('Deploying and Integration tests') {
+            steps {
+                build job: 'magellan-it',
+                        parameters: [
+                                string(name: 'NIGHTLY_JOB_NAME', value: String.valueOf(JOB_BASE_NAME)),
+                                string(name: 'NIGHTLY_BUILD_ID', value: String.valueOf(BUILD_NUMBER)),
+                                string(name: 'NIGHTLY_BUILD_DATE', value: String.valueOf(NIGHTLY_BUILD_DATE)),
+                                string(name: 'NIGHTLY_BRANCH_NAME', value: 'develop'),
+                                string(name: 'BASE_NDP_VERSION', value: '1.1.0.580')
+                        ]
+            }
+        }
+        stage ('Deploy package on alpha cluster') {
+            steps{
+                  build job: 'deploy_package_on_alpha'
+            }
+        }
+        
+//        stage("Email report") {
+//            when {not {
+//                expression {env.branch.startsWith("PR-")}
+//            }}
+//            steps {
+//                sh '''
+//                export PYTHONPATH=/home/apic/devtools
+//                cd /home/apic/devtools
+//                python3 ./handlers/email/sonar_new.py --package_version 1.0-SNAPSHOT-${BUILD_NUMBER} --git_commit_id ${GIT_COMMIT} --job_id ${BUILD_NUMBER} --project Magellan --email_header "Magellan nightly" --isFT True --m_list ghayo,hshmilov,prakgoya,ajsingla --jenkins_job ${JOB_URL} --sonar_main_branch ndp-base-pipelines,tesseract-collectors,magellan --branches develop,branch-ft || true
+//                '''
+//            }
+//        }
+    }
+      post {
+        always { 
+            cleanWs()
+            
+            //sending mail report
+            script {
+                if (not (env.branch.startsWith("PR-"))){
+                    sh '''
+                    export PYTHONPATH=/home/spa/devtools
+                    export NO_PROXY=.cisco.com
+                    cd /home/spa/devtools
+                    #pip3 install --proxy=http://proxy.esl.cisco.com:8080/ -r requierments.txt
+                    python3 ./handlers/email/magellan_email_report.py --package_version 2.0.${BUILD_NUMBER} --job_id ${BUILD_NUMBER} --project Magellan --email_header "Magellan nightly" --isFT True --m_list ghayo,hshmilov,prakgoya,ajsingla,pkonda,vinverma,hungund,pmahesh,pravigan,smpravee,sandryu,magellan-blr --jenkins_job ${JOB_URL} --sonar_main_branch ndp-base-pipelines,tesseract-collectors,magellan,magellan-ui --branches develop,branch-ft,branch-all || true
+                    '''
+                }
+            }
+        }
+        success {
+            mail bcc: '', body: "Please check the Following link:\n\n${JOB_URL}/${BUILD_NUMBER}/console", cc: "", from: 'spa-devops@cisco.com', replyTo: '', subject: "Magellan Pipeline Success", to: "ghayo@cisco.com,hshmilov@cisco.com,prakgoya@cisco.com,pkonda@cisco.com,vinverma@cisco.com,hungund@cisco.com,pmahesh@cisco.com,pravigan@cisco.com,smpravee@cisco.com,sandryu@cisco.com,magellan-blr@cisco.com"
+        }
+            
+        failure{
+            echo "failed: sending email"
+            mail bcc: '', body: "Please check the Following link:\n\n${JOB_URL}/${BUILD_NUMBER}/console", cc: "", from: 'spa-devops@cisco.com', replyTo: '', subject: "Magellan Pipeline Failed", to: "ghayo@cisco.com,hshmilov@cisco.com,prakgoya@cisco.com,pkonda@cisco.com,vinverma@cisco.com,hungund@cisco.com,pmahesh@cisco.com,pravigan@cisco.com,smpravee@cisco.com,sandryu@cisco.com,magellan-blr@cisco.com"
+        }
+    }
+}
