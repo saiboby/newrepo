@@ -1,0 +1,549 @@
+/* call with parameters: BASE_NDP_VERSION and BUILD_ID
+ *
+ */
+pipeline {
+    agent {
+            label 'docker'
+    }
+
+    environment {
+        targetMachineIp = '10.76.231.81'
+        sshCredentialKey = '10.76.231.81_KEY'
+        magellanVmCreds = 'magellan-vm'
+        magellanVmIp = '10.76.231.83'
+        maglevUserPass = 'maglev1@3'
+        autosetup = 'autosetup-ndp-magellan-1.3.0.sh'
+        res = ''
+        portFound = ''
+        portDes = ''
+        allLines = null
+        deployPass = false
+        artifactName = null
+        artifactBaseFolder = null
+        tmpArtifactFolder = "tmpArtifacts"
+        reportFolder = "covReports"		
+		mockDataDir = "http://engci-maven.cisco.com/artifactory/list/ng-ise-thirdparty/scripts/mockdata-2019/"
+		epfile0="mock-ep-p-master-0.json"
+		epfile1="mock-ep-p-master-1.json"
+		nffile0="mock-nf-p-master-0.json"
+		nffile1="mock-nf-p-master-1.json"
+        scriptURL = "http://engci-maven-master.cisco.com/artifactory/list/ng-ise-thirdparty/scripts/"
+        magellanRestClientJar = "magellan-restclient.jar"
+        magellanRestClientDependentJar = "restclientdependents.jar"
+        dirTestRestClient = "testrestclient"
+//        delOldDataFolder = "/data/maglev/srv/ndp"
+        SONAR_HOST = 'https://engci-sonar-sjc.cisco.com/sonar'
+        SONAR_HOST_LOCAL = 'http://10.126.68.210:9000/'
+
+        SONAR_BRANCH = 'branch-ft'
+        PATH = "/usr/local/bin:$PATH"
+        HOME = "/root"
+        default_ndp_version = '1.3.0.101'
+
+        JACOCO_SERVICE_PORT = '36320'
+        JACOCO_FILE_MAGELLAN = 'build/jacoco/magellanIntTest.exec'
+        JACOCO_FILE_COLLECTOR_ISE = 'build/jacoco/iseCollectorIntTest.exec'
+        JACOCO_FILE_PIPELINES = 'build/jacoco/ndpBasePipelinesIntTest.exec'
+        JACOCO_FILE_PIPELINES_LARGE = 'build/jacoco/ndpBasePipelinesLargeIntTest.exec'
+
+        BASE_NDP_VERSION = '1.3.0.101'
+
+        gradle_proxy="-Dhttp.proxyHost=proxy.esl.cisco.com -Dhttp.nonProxyHosts=*.cisco.com -Dhttps.nonProxyHosts=*.cisco.com -Dhttp.proxyPort=8080 -Dhttps.proxyHost=proxy.esl.cisco.com -Dhttps.proxyPort=8080"
+
+       //NIGHTLY_JOB_NAME = ${env.NIGHTLY_JOB_NAME}
+        //NIGHTLY_BUILD_ID = ${env.NIGHTLY_BUILD_ID}
+        //NIGHTLY_BUILD_DATE = ${env.NIGHTLY_BUILD_DATE}
+        //NIGHTLY_BRANCH_NAME = ${env.NIGHTLY_BRANCH_NAME}
+        COVERAGE_DIR = "/builds/${NIGHTLY_JOB_NAME}-${NIGHTLY_BUILD_ID}-${NIGHTLY_BRANCH_NAME}-${NIGHTLY_BUILD_DATE}/ft-coverage-files"
+    }
+//    options {
+//        timeout(time: 40, unit: 'MINUTES')
+//    }
+    stages {
+        stage('Copy Artifact to CI Machine') {
+            steps {
+                
+                println "Stage::Copy Artifact to CI Machine::Starting:"
+                loadArtifactDetails()
+                sh "rm -rf -- ${tmpArtifactFolder}"
+                sh "mkdir -p ${tmpArtifactFolder}"
+//                sh "rm -rf -- ${delOldDataFolder}"
+//                sh "mkdir -p ${delOldDataFolder}"
+                sh "mkdir -p ${reportFolder}"
+                dir("${tmpArtifactFolder}") {
+
+                    // Copy artifact to integration test-bed
+                    sshagent(credentials: ['ngise-autonas']) {
+                        script {
+                            res = sh(script: "sshpass -p Lab@123 ssh -o StrictHostKeyChecking=no root@auto-nas-isr.cisco.com 'cd /volume1/vms/packages/MAGELLAN/builds/${artifactBaseFolder} && ls ${artifactName}'", returnStdout: true)
+                            println "Artifact name on builder is: " + res
+                            artifactName = res.toString().trim()
+                        }
+
+                    }
+                    //create soft link to the package
+                    sh "sshpass -p Lab@123 ssh -o StrictHostKeyChecking=no root@auto-nas-isr.cisco.com 'cd /volume1/vms/packages/MAGELLAN/builds/${artifactBaseFolder} && ln -s ./${artifactName} latest_pkg'"
+                  
+                    // Make artifact directory
+                    sh "sshpass -p ${maglevUserPass} ssh -o StrictHostKeyChecking=no -p 2222 maglev@${targetMachineIp} mkdir -p /home/maglev/artifacts"
+
+                    // Upload artifact to maglev
+                    sh """sshpass -p ${maglevUserPass} ssh -p 2222 -o "StrictHostKeyChecking=no" -v maglev@${targetMachineIp} 'cd /home/maglev/artifacts && wget http://auto-nas-isr.cisco.com/packages/MAGELLAN/builds/${artifactBaseFolder}/${artifactName}'"""
+
+                }
+            }
+        }
+
+        stage('Install NDP Package') {
+            steps {
+                
+                sh """
+                    sshpass -p ${maglevUserPass} ssh -p 2222 -o StrictHostKeyChecking=no maglev@${targetMachineIp} "cd /home/maglev/artifacts && wget -N -P /home/maglev/artifacts/ ${scriptURL}${autosetup} && chmod +x /home/maglev/artifacts/${autosetup} && maglev login -u admin -p ${maglevUserPass} && /home/maglev/artifacts/${autosetup} -c ${targetMachineIp} -f /home/maglev/artifacts/${artifactName}"
+                """
+
+                script {
+                    res = sh(script: "sshpass -p ${maglevUserPass} ssh -p 2222 -o StrictHostKeyChecking=no maglev@${targetMachineIp} 'maglev login -u admin -p ${maglevUserPass} -c ${targetMachineIp} && maglev package status'", returnStdout: true)
+                    println "Maglev package status:" + res
+                    deployPass = verifyDeploy(res.toString())
+                    if (!deployPass) {
+                        //mark build status as failure
+                        currentBuild.result = "FAILURE"
+                        println "Deployment Failed"
+                        return;
+                    }
+                }
+                println "Gonna sleep - let ElasticSearch loads the index"
+                sleep 90
+            }
+        }
+        
+        stage ('Push Mockdata to CI Machine') {
+            steps {
+                println "Stage::Push mock data to CI Machine::Starting: ${new Date()}"            
+            
+                sh """                                    
+                    sshpass -p ${maglevUserPass} ssh -p 2222 -o "StrictHostKeyChecking=no" -v maglev@${targetMachineIp} 'cd /home/maglev/artifacts && wget -N -P /home/maglev/artifacts/ ${mockDataDir}${epfile0} && wget -N -P /home/maglev/artifacts/ ${mockDataDir}${epfile1} && wget -N -P /home/maglev/artifacts/ ${mockDataDir}${nffile0} && wget -N -P /home/maglev/artifacts/ ${mockDataDir}${nffile1} && wget -N -P /home/maglev/artifacts/ http://maglev-fileserver.cisco.com/artifacts/ndp/tools/ndp-kafka-tools-all-1.2-SNAPSHOT.jar && maglev login -u admin -p ${maglevUserPass} -c ${targetMachineIp} && kubectl cp ${epfile0}  --container kafka ndp/kafka-0:/tmp/ && kubectl cp ${epfile1}  --container kafka ndp/kafka-0:/tmp/ && kubectl cp ${nffile0}  --container kafka ndp/kafka-0:/tmp/ && kubectl cp ${nffile1}  --container kafka ndp/kafka-0:/tmp/ && kubectl cp ndp-kafka-tools-all-1.2-SNAPSHOT.jar  --container kafka ndp/kafka-0:/tmp/ && kubectl exec -it kafka-0 --container kafka -n ndp -- bash -c "java -classpath /tmp/ndp-kafka-tools-all-1.2-SNAPSHOT.jar -DKAFAKBROKER=localhost:9092 -DJSON=true com.cisco.tessaract.ndp.kafka.Importer graphstream /tmp/${epfile0} && exit" && kubectl exec -it kafka-0 --container kafka -n ndp -- bash -c "java -classpath /tmp/ndp-kafka-tools-all-1.2-SNAPSHOT.jar -DKAFAKBROKER=localhost:9092 -DJSON=true com.cisco.tessaract.ndp.kafka.Importer graphstream /tmp/${nffile0} && exit" && kubectl exec -it kafka-0 --container kafka -n ndp -- bash -c "java -classpath /tmp/ndp-kafka-tools-all-1.2-SNAPSHOT.jar -DKAFAKBROKER=localhost:9092 -DJSON=true com.cisco.tessaract.ndp.kafka.Importer graphstream /tmp/${epfile1} && exit" && kubectl exec -it kafka-0 --container kafka -n ndp -- bash -c "java -classpath /tmp/ndp-kafka-tools-all-1.2-SNAPSHOT.jar -DKAFAKBROKER=localhost:9092 -DJSON=true com.cisco.tessaract.ndp.kafka.Importer graphstream /tmp/${nffile1} && exit"'
+                """
+                
+                println "Gonna sleep - let ElasticSearch loads the index"
+                sleep 300
+            
+            }
+        }
+
+//        stage('Send Data to ISE and Stealthwatch Flow Collector') {
+//            steps {
+//                sshagent(credentials: ["${magellanVmCreds}"]) {
+//                    sh "ssh -o StrictHostKeyChecking=no magellan@${magellanVmIp} 'cd /home/magellan/feature-test/orchestrate && ./orchestrate_prakgoya.sh'"
+//                }
+//            }
+//        }
+    
+
+//        stage('Magellan UI UT after Bundle') {
+//            steps {
+//                build job: 'magellan_ui_ut',
+//                        parameters: [
+//                                string(name: 'NIGHTLY_JOB_NAME', value: String.valueOf(NIGHTLY_JOB_NAME)),
+//                                string(name: 'NIGHTLY_BUILD_ID', value: String.valueOf(NIGHTLY_BUILD_ID)),
+//                                string(name: 'NIGHTLY_BUILD_DATE', value: String.valueOf(NIGHTLY_BUILD_DATE)),
+//                                string(name: 'MAGLEV_CLUSTER', value: String.valueOf(targetMachineIp))
+//                        ]
+//            }
+//        }
+
+        stage('Checkout code') {
+            steps {
+                sh "sudo rm -rf magellan-ui* magellan* tesseract-collectors* ndp-base-pipelines* || true"
+
+                sshagent(credentials: ['ngise-autonas']) {
+                    sh """
+                        sshpass -p "Lab@123" ssh -o StrictHostKeyChecking=no root@auto-nas-isr.cisco.com "mkdir -p /volume1/vms/packages/MAGELLAN/$COVERAGE_DIR"
+                    """
+                }
+
+                checkout([$class: 'GitSCM', branches: [[name: '*/develop-v4']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'Magellan-v2'], [$class: 'CheckoutOption', timeout: 10]], gitTool: 'Default', submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'ngise-gen-bitbucket', url: 'ssh://git@bitbucket-eng-sjc1.cisco.com:7999/ngise/magellan-v2.git']]])
+                
+                checkout([$class: 'GitSCM', branches: [[name: '*/develop']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'tesseract-collectors'], [$class: 'CheckoutOption', timeout: 10]], gitTool: 'Default', submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'ngise-gen-bitbucket', url: 'ssh://git@bitbucket-eng-sjc1.cisco.com:7999/ngise/tesseract-collectors.git']]])
+
+                checkout([$class: 'GitSCM', branches: [[name: '*/develop']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'ndp-base-pipelines'], [$class: 'CheckoutOption', timeout: 10]], gitTool: 'Default', submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'ngise-gen-bitbucket', url: 'ssh://git@bitbucket-eng-sjc1.cisco.com:7999/ngise/ndp-base-pipelines.git']]])
+
+                checkout([$class: 'GitSCM', branches: [[name: '*/develop']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'magellan-ui-v2'], [$class: 'CheckoutOption', timeout: 10]], gitTool: 'Default', submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'ngise-gen-bitbucket', url: 'ssh://git@bitbucket-eng-sjc1.cisco.com:7999/ngise/magellan-ui-v2.git']]])
+            }
+        }
+        
+        stage ("AUTOMATION : FT ") {
+             steps {
+                build job: 'magellan-ft',
+                        parameters: [
+                                string(name: 'NIGHTLY_JOB_NAME', value: String.valueOf(NIGHTLY_JOB_NAME)),
+                                string(name: 'NIGHTLY_BUILD_ID', value: String.valueOf(NIGHTLY_BUILD_ID)),
+                                string(name: 'NIGHTLY_BUILD_DATE', value: String.valueOf(NIGHTLY_BUILD_DATE)),
+//                                string(name: 'MAGLEV_CLUSTER', value: String.valueOf(targetMachineIp))
+                        ]
+            }
+        }
+      
+      	stage ("AUTOMATION-UI: FT ") {
+             steps {
+                build job: 'magellan-ui-ft-new',
+                        parameters: [
+                                string(name: 'NIGHTLY_JOB_NAME', value: String.valueOf(NIGHTLY_JOB_NAME)),
+                                string(name: 'NIGHTLY_BUILD_ID', value: String.valueOf(NIGHTLY_BUILD_ID)),
+                                string(name: 'NIGHTLY_BUILD_DATE', value: String.valueOf(NIGHTLY_BUILD_DATE)),
+//                                string(name: 'MAGLEV_CLUSTER', value: String.valueOf(targetMachineIp))
+                        ]
+            }
+        }
+
+        stage('Push Magellan Coverage To Sonar') {
+            agent {
+                docker {
+                    label 'docker'
+                    image 'dockerhub.cisco.com/isepy-release-docker/spa-worker:1.3'
+                    args '-u root:root -v $WORKSPACE/.gradle:/root/.gradle -v $WORKSPACE/.m2:/root/.m2 -v $WORKSPACE/Magellan-v2:/root/magellan --dns=173.38.165.13 --dns-search=cisco.com'
+                    reuseNode true
+                }
+            }
+
+            environment {
+                SONAR_PROJECT = 'magellan'
+                SONAR_PROJECT_VERSION = '2.0'
+                SONAR_COVERAGE_EXCLUSIONS = '**/*FilterHelper.java,**/*QueryHelper.java,**/*GraphClient.java,**/*GraphStore.java,**/*StreamOutputImpl.java,**/*StreamOutputObjectImpl.java'
+                CODE_DIRECTORY = '/root/magellan'
+                portFound = ''
+            }
+
+            steps {
+                println "Stage::Push Code Coverage To Sonar::Starting: ${NIGHTLY_BUILD_DATE}"
+
+                script {
+                    portDes = sh(script: "sshpass -p ${maglevUserPass} ssh -p 2222 -o StrictHostKeyChecking=no maglev@${targetMachineIp} 'magctl service expose magellan ${JACOCO_SERVICE_PORT}'", returnStdout: true)
+
+                    println "port:" + portDes
+                    portFound = fetchPort(portDes.toString())
+                    println "portFound:" + portFound
+
+                    if (!portFound) {
+                        //mark build status as failure
+                        currentBuild.result = "FAILURE"
+                        println "Unable to fetch exposed port for magellan"
+                        return;
+                    }
+                }
+                
+
+                sh """
+                    cd $CODE_DIRECTORY
+                    gradle $gradle_proxy -PftServer=$targetMachineIp -PftPort=$portFound dumpJacoco
+                    ls -lh build/jacoco/
+                """
+
+
+                sshagent(credentials: ['ngise-autonas']) {
+                    echo "Pushing magellan exec file to Israel NAS"
+                    sh """
+                        sshpass -p "Lab@123" scp -o StrictHostKeyChecking=no $CODE_DIRECTORY/$JACOCO_FILE_MAGELLAN root@auto-nas-isr.cisco.com:/volume1/vms/packages/MAGELLAN/$COVERAGE_DIR/
+                    """
+                }
+				
+              	
+                sh """
+                    	cd $CODE_DIRECTORY
+                    	gradle $gradle_proxy compileJava
+                    
+                    	cp sonar-scanner.properties /opt/sonar-scanner/sonar-scanner-3.2.0.1227-linux/conf/sonar-scanner.properties
+				    	cp sonar-scanner.properties sonar-project.properties
+				    	cat /opt/sonar-scanner/sonar-scanner-3.2.0.1227-linux/conf/sonar-scanner.properties
+                    	sonar-scanner -Dsonar.projectVersion=$SONAR_PROJECT_VERSION.$NIGHTLY_BUILD_ID -Dsonar.branch.name=$SONAR_BRANCH -Dsonar.coverage.exclusions=$SONAR_COVERAGE_EXCLUSIONS -Dsonar.jacoco.reportPaths=$CODE_DIRECTORY/$JACOCO_FILE_MAGELLAN
+                    
+                    	cd $CODE_DIRECTORY
+                    	gradle sonarqube $gradle_proxy -Dtest.ignoreFailures=true -Dsonar.host.url=$SONAR_HOST -Dsonar.projectKey=$SONAR_PROJECT -Dsonar.projectName=$SONAR_PROJECT -Dsonar.projectVersion=$SONAR_PROJECT_VERSION.$NIGHTLY_BUILD_ID -Dsonar.branch.name=branch-all -Dsonar.coverage.exclusions=$SONAR_COVERAGE_EXCLUSIONS -Dsonar.jacoco.reportPaths=$CODE_DIRECTORY/$JACOCO_FILE_MAGELLAN
+
+                """
+                
+
+                println "Stage::Pushing of Reports to Sonar is Done::Ending: ${NIGHTLY_BUILD_DATE}"
+            }
+        }
+
+        stage('Push Collector Coverage To Sonar') {
+            agent {
+                docker {
+                    label 'docker'
+                    image 'dockerhub.cisco.com/isepy-release-docker/spa-worker:1.3'
+                    args '-u root:root -v $WORKSPACE/.gradle:/root/.gradle -v $WORKSPACE/.m2:/root/.m2 -v $WORKSPACE/tesseract-collectors:/go/src/cisco.com/tesseract/tesseract-collectors --dns=173.38.165.13 --dns-search=cisco.com'
+                    reuseNode true
+                }
+            }
+
+            environment {
+                SONAR_PROJECT = 'tesseract-collectors'
+                SONAR_PROJECT_VERSION = '2.0'
+                PATH = "/opt/sonar-scanner/sonar-scanner-3.2.0.1227-linux/bin:/usr/local/go/bin:/go/bin:$PATH"
+                GOPATH = "/go"
+                CODE_DIRECTORY = '/go/src/cisco.com/tesseract/tesseract-collectors'
+                portFound = ''
+            }
+
+            steps {
+                println "Stage::Push Code Coverage To Sonar::Starting: ${NIGHTLY_BUILD_DATE}"
+                
+                script {
+                    portDes = sh(script: "sshpass -p ${maglevUserPass} ssh -p 2222 -o StrictHostKeyChecking=no maglev@${targetMachineIp} 'magctl service expose collector-ise ${JACOCO_SERVICE_PORT}'", returnStdout: true)
+
+                    println "port:" + portDes
+                    portFound = fetchPort(portDes.toString())
+                    println "portFound:" + portFound
+
+                    if (!portFound) {
+                        //mark build status as failure
+                        currentBuild.result = "FAILURE"
+                        println "Unable to fetch exposed port for collector-ise"
+                        return;
+                    }
+                }
+                
+
+                sh """
+                    cd $CODE_DIRECTORY
+                    gradle -PftServer=$targetMachineIp -PftPort=${portFound} dumpJacoco
+                    ls -lh build/jacoco/
+                """
+
+
+                sshagent(credentials: ['ngise-autonas']) {
+                    echo "Pushing collector exec file to Israel NAS"
+                    sh """
+                        sshpass -p "Lab@123" scp -o StrictHostKeyChecking=no $CODE_DIRECTORY/$JACOCO_FILE_COLLECTOR_ISE root@auto-nas-isr.cisco.com:/volume1/vms/packages/MAGELLAN/$COVERAGE_DIR/
+                    """
+                }
+
+              	withSonarQubeEnv('aca-sonar') {
+                	sh """
+                    	cd $CODE_DIRECTORY
+                    	gradle compileJava
+                    
+                    	cp sonar-scanner.properties /opt/sonar-scanner/sonar-scanner-3.2.0.1227-linux/conf/sonar-scanner.properties
+				    	cp sonar-scanner.properties sonar-project.properties
+				    	cat /opt/sonar-scanner/sonar-scanner-3.2.0.1227-linux/conf/sonar-scanner.properties
+                    	sonar-scanner -Dsonar.host.url=$SONAR_HOST -Dsonar.projectKey=$SONAR_PROJECT -Dsonar.projectName=$SONAR_PROJECT -Dsonar.projectVersion=$SONAR_PROJECT_VERSION.$NIGHTLY_BUILD_ID -Dsonar.branch.name=$SONAR_BRANCH -Dsonar.jacoco.reportPaths=$CODE_DIRECTORY/$JACOCO_FILE_COLLECTOR_ISE 
+                    
+                    	cd $CODE_DIRECTORY
+                    	gradle sonarqube -Dtest.ignoreFailures=true -Dsonar.host.url=$SONAR_HOST -Dsonar.projectKey=$SONAR_PROJECT -Dsonar.projectName=$SONAR_PROJECT -Dsonar.projectVersion=$SONAR_PROJECT_VERSION.$NIGHTLY_BUILD_ID -Dsonar.branch.name=branch-all -Dsonar.jacoco.reportPaths=$CODE_DIRECTORY/$JACOCO_FILE_COLLECTOR_ISE
+
+
+                    
+
+                    	#cd collector-stealthwatch-fc
+                    	#./runSonar.sh
+
+                    	#cd ..
+                    	#cd c-netflowgo
+                    	#sonar-scanner
+                	"""
+                }
+
+                println "Stage::Pushing of Reports to Sonar is Done::Ending: ${NIGHTLY_BUILD_DATE}"
+            }
+        }
+
+        stage('Push Pipeline Coverage To Sonar') {
+            agent {
+                docker {
+                    label 'docker'
+                    image 'dockerhub.cisco.com/isepy-release-docker/spa-worker:1.3'
+                    args '-u root:root -v $WORKSPACE/.gradle:/root/.gradle -v $WORKSPACE/.m2:/root/.m2 -v $WORKSPACE/ndp-base-pipelines:/root/ndp-base-pipelines --dns=173.38.165.13 --dns-search=cisco.com'
+                    reuseNode true
+                }
+            }
+
+            environment {
+                SONAR_PROJECT = 'ndp-base-pipelines'
+                SONAR_PROJECT_VERSION = '2.0'
+                CODE_DIRECTORY = '/root/ndp-base-pipelines'
+                portFound = ''
+            }
+
+            steps {
+                println "Stage::Push Code Coverage To Sonar::Starting: ${NIGHTLY_BUILD_DATE}"
+
+                script {
+                    portDes = sh(script: "sshpass -p ${maglevUserPass} ssh -p 2222 -o StrictHostKeyChecking=no maglev@${targetMachineIp} 'magctl service expose pipelineruntime-taskmgr-large ${JACOCO_SERVICE_PORT}'", returnStdout: true)
+
+                    println "port:" + portDes
+                    portFound = fetchPort(portDes.toString())
+                    println "portFound:" + portFound
+
+                    if (!portFound) {
+                        //mark build status as failure
+                        currentBuild.result = "FAILURE"
+                        println "Unable to fetch exposed port for magellan"
+                        return;
+                    }
+                }
+            
+
+                sh """
+                    cd ${CODE_DIRECTORY}
+                    gradle -PftServer=${targetMachineIp} -PftPort=${portFound} dumpJacoco
+                    ls -lh build/jacoco/
+                    mv $JACOCO_FILE_PIPELINES $JACOCO_FILE_PIPELINES_LARGE
+                """
+
+                script {
+                    cmd = """kubectl get pods -n ndp | grep pipelineruntime-taskmgr | grep -v data | grep -v timeseries | grep -v large -m1 |sed 's/|/ /'|awk '{print \$1}'| tr -d '\n'"""
+                    service_to_expose = sh(script: "sshpass -p ${maglevUserPass} ssh -p 2222 -o StrictHostKeyChecking=no maglev@${targetMachineIp} ${cmd}", returnStdout: true)
+                    portDes = sh(script: """sshpass -p ${maglevUserPass} ssh -p 2222 -o StrictHostKeyChecking=no maglev@${targetMachineIp} 'magctl service expose ${service_to_expose} ${JACOCO_SERVICE_PORT}'""", returnStdout: true)
+                    
+                    println "port:" + portDes
+                    portFound = fetchPort(portDes.toString())
+                    println "portFound:" + portFound
+
+                    if (!portFound) {
+                        //mark build status as failure
+                        currentBuild.result = "FAILURE"
+                        println "Unable to fetch exposed port for magellan"
+                        return;
+                    }
+                }
+                
+
+                sh """
+                    cd $CODE_DIRECTORY
+                    gradle -PftServer=$targetMachineIp -PftPort=$portFound dumpJacoco
+                    ls -lh build/jacoco/
+                """
+
+
+                sshagent(credentials: ['ngise-autonas']) {
+                    echo "Pushing pipeline exec file to Israel NAS"
+                    sh """
+                        sshpass -p "Lab@123" scp -o StrictHostKeyChecking=no $CODE_DIRECTORY/$JACOCO_FILE_PIPELINES root@auto-nas-isr.cisco.com:/volume1/vms/packages/MAGELLAN/$COVERAGE_DIR/
+                    """
+                    sh """
+                        sshpass -p "Lab@123" scp -o StrictHostKeyChecking=no $CODE_DIRECTORY/$JACOCO_FILE_PIPELINES_LARGE root@auto-nas-isr.cisco.com:/volume1/vms/packages/MAGELLAN/$COVERAGE_DIR/
+                    """
+                }
+				
+              	withSonarQubeEnv('aca-sonar') {
+                	sh  """
+                    	cd $CODE_DIRECTORY
+                    	gradle compileJava
+                    
+                    	cp sonar-scanner.properties /opt/sonar-scanner/sonar-scanner-3.2.0.1227-linux/conf/sonar-scanner.properties
+				    	cp sonar-scanner.properties sonar-project.properties
+				    	cat /opt/sonar-scanner/sonar-scanner-3.2.0.1227-linux/conf/sonar-scanner.properties
+                    	sonar-scanner -Dsonar.host.url=$SONAR_HOST -Dsonar.projectKey=$SONAR_PROJECT -Dsonar.projectName=$SONAR_PROJECT -Dsonar.projectVersion=$SONAR_PROJECT_VERSION.$NIGHTLY_BUILD_ID -Dsonar.branch.name=$SONAR_BRANCH -Dsonar.jacoco.reportPaths=$CODE_DIRECTORY/$JACOCO_FILE_PIPELINES,$CODE_DIRECTORY/$JACOCO_FILE_PIPELINES_LARGE
+                    
+                    	cd $CODE_DIRECTORY
+                    	gradle sonarqube -Dtest.ignoreFailures=true -Dsonar.host.url=$SONAR_HOST -Dsonar.projectKey=$SONAR_PROJECT -Dsonar.projectName=$SONAR_PROJECT -Dsonar.projectVersion=$SONAR_PROJECT_VERSION.$NIGHTLY_BUILD_ID -Dsonar.branch.name=branch-all -Dsonar.jacoco.reportPaths=$CODE_DIRECTORY/$JACOCO_FILE_PIPELINES,$CODE_DIRECTORY/$JACOCO_FILE_PIPELINES_LARGE
+                    	"""
+                }
+
+                println "Stage::Pushing of Reports to Sonar is Done::Ending: ${NIGHTLY_BUILD_DATE}"
+
+
+            }
+        }
+      
+    	//stage ('Deploy_package_on_alpha_cluster') {
+        //    steps{
+        //          build job: 'deploy_package_on_alpha',
+        //          parameters: [
+        //                      string(name: 'artifactName', value: ${artifactName}),
+        //                      string(name: 'artifactBaseFolder', value: String.valueOf(artifactBaseFolder))
+        //                      ]
+
+        //    }
+        //}
+      
+    }
+    post {
+        always { 
+            cleanWs()
+        }
+    }
+}
+/*
+ * verifyDeploy: Loops through each line of the passed in String
+ * returns false, if line starts with magellan/ndp-platform/ndp-base-analytics/ndp-ui and contains NOT_DEPLOYED
+ * otherwise returns true
+ * Todo:: Add version check also
+ */
+
+boolean verifyDeploy(String maglevPkgStatus) {
+    if (!maglevPkgStatus?.trim()) {
+        return false
+    }
+    String[] allLines = maglevPkgStatus.split("\n")
+    String strNotDeployed = 'NOT_DEPLOYED'
+    for (String line in allLines) {
+        //println "verifyDeploy::allLines::lines:" + line
+        if (line?.trim() && (line.startsWith('magellan ')
+                || line.startsWith('ndp-ui ')
+                || line.startsWith('ndp-platform ')
+                || line.startsWith('ndp-base-analytics '))) {
+            if (line.contains(strNotDeployed)) {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+String getArtifactBaseFolderName() {
+    def branch = null
+    if ("master".equalsIgnoreCase(env.NIGHTLY_BRANCH_NAME)) {
+        branch = 'master'
+    } else if ("develop".equalsIgnoreCase(env.NIGHTLY_BRANCH_NAME)) {
+        branch = 'develop'
+    } else {
+        branch = 'develop'
+    }
+    if (env.NIGHTLY_JOB_NAME != null && env.NIGHTLY_BUILD_ID != null) {
+        branch = env.NIGHTLY_JOB_NAME + "-" + env.NIGHTLY_BUILD_ID + "-" + branch
+    } else {
+        branch = env.JOB_BASE_NAME + "-" + env.NIGHTLY_BUILD_ID + "-" + branch
+    }
+    //date = new Date().format("yyyy-MM-dd")
+    date = env.NIGHTLY_BUILD_DATE
+    return "${branch}-${date}/integration"
+}
+
+String fetchPort(String port) {
+    if (!port?.trim()) {
+        return false
+    }
+    String[] allLines = port.split("\n")
+    String portNo = 'port'
+    String portFound = '';
+    for (String line in allLines) {
+        //println "verifyDeploy::allLines::lines:" + line
+        if (line?.trim() && line.startsWith('Debug ')) {
+            if (line.contains(portNo)) {
+                String[] allWords = port.split(":")
+                if (allWords.length != 0) {
+                    portFound = allWords[allWords.length - 1];
+                }
+
+            }
+        }
+    }
+    return portFound.trim()
+}
+
+def loadArtifactDetails() {
+    //artifactName = "ndp-daily-${env.BASE_NDP_VERSION}.${env.BUILD_ID}.tar.gz"
+    def base_ndp_version = null
+    if (env.BASE_NDP_VERSION != null) {
+        base_ndp_version = env.BASE_NDP_VERSION;
+    } else {
+        base_ndp_version = default_ndp_version;
+    }
+
+    artifactName = "ndp-daily-${base_ndp_version}.*.tar.gz"
+    println "artifactName: ${artifactName}"
+    artifactBaseFolder = getArtifactBaseFolderName()
+    println "artifactBaseFolder: ${artifactBaseFolder}"
+}

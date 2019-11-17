@@ -1,0 +1,61 @@
+pipeline {
+    agent {
+        docker {
+            label 'docker'
+            image 'dockerhub.cisco.com/isepy-release-docker/spa-worker:1.3'
+            args '-u root:root -v /home/spa/devtools:/root/devtools -v $WORKSPACE/.gradle:/root/.gradle -v $WORKSPACE/.m2:/root/.m2 --dns=173.38.200.100 --dns-search=cisco.com --env http_proxy=http://proxy.esl.cisco.com:80/ --env https_proxy=http://proxy.esl.cisco.com:80/ --env no_proxy=*.cisco.com'
+        }
+    }
+        parameters {
+        string(name: 'NIGHTLY_JOB_NAME', defaultValue: '', description: '')
+        string(name: 'NIGHTLY_BUILD_ID', defaultValue: '', description: '')
+        string(name: 'NIGHTLY_BUILD_DATE', defaultValue: '', description: '')
+        }
+        environment {
+            date = ''
+            branch = ''
+        }
+    
+    stages {
+        stage("AUTOMATION : FT "){
+            steps{
+                git branch: 'jenkinsCI', changelog: false, credentialsId: 'eed60d57-b2eb-4a88-b6fc-8a1e267d4511', poll: false, url: 'https://bitbucket-eng-sjc1.cisco.com/bitbucket/scm/ngise/magellan-cicd.git'
+
+                sh '''
+                echo $WORKSPACE
+                $WORKSPACE/modifyRequestDateRanges.sh
+
+                devtools=/root/devtools
+                cd $WORKSPACE/automation/
+                test_folder=$WORKSPACE/automation/mag_v2/tests/
+                
+                pip3 install -U pytest
+                pip3 install pytest==3.9.3
+                pytest --version
+                pip3 install pytest-json-report==0.7.0
+                
+                export PYTEST_ADDOPTS="--junitxml=/tmp/pytest/report.xml --json-report --json-report-file=/tmp/pytest/report.json"
+                export PYTHONPATH=${devtools}
+                export LC_ALL=C.UTF-8
+                export LANG=C.UTF-8
+                
+                unset http_proxy
+                unset https_proxy
+                unset HTTP_PROXY
+                unset HTTPS_PROXY
+                
+                # pip3 install -r requierments.txt
+            	
+                echo "run pytest tests under folder: ${test_folder}"
+                
+				cp ${devtools}/handlers/reporting/pytest_with_report.py ${test_folder}
+				cp ${devtools}/handlers/reporting/pytest_with_report.py ${test_folder}../
+				cd ${test_folder}../../
+
+                python3 -m pytest ${test_folder} || true
+                python3 ${devtools}/handlers/reporting/report_to_database.py --product MAGELLAN -component Features --suitename magellan_backend_v4 --version 2.0.$NIGHTLY_BUILD_ID 
+        	    '''
+            }
+        }
+    }
+}  
